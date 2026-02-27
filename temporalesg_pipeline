@@ -1,0 +1,167 @@
+import os
+import json
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from elasticsearch import Elasticsearch
+from typing import List, Dict, Tuple
+
+DATA_DIR = "path/to/TemporalESG/corpus"
+QUERY_FILE = "path/to/TemporalESG/queries.json"
+EMBEDDING_CACHE = "path/to/embeddings.npy"
+INDEX_NAME = "temporalesg_bm25"
+
+EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
+BM25_K1 = 1.2
+BM25_B = 0.75
+TEMPORAL_LAMBDA = 0.3
+WEIGHTS = {"lex": 0.3, "sem": 0.4, "temp": 0.3}
+TOP_K = 10
+
+def load_documents(data_dir: str) -> List[Dict]:
+    docs = []
+    for filename in os.listdir(data_dir):
+        if filename.endswith(".jsonl"):
+            with open(os.path.join(data_dir, filename), 'r', encoding='utf-8') as f:
+                for line in f:
+                    docs.append(json.loads(line))
+    return docs
+
+def load_queries(query_file: str) -> List[Dict]:
+    with open(query_file, 'r', encoding='utf-8') as f:
+        queries = json.load(f)
+    return queries
+
+def generate_or_load_embeddings(docs: List[Dict], model_name: str, cache_file: str) -> np.ndarray:
+    if os.path.exists(cache_file):
+        print("Loading cached embeddings...")
+        return np.load(cache_file)
+    
+    print("Generating embeddings (this may take a while)...")
+    model = SentenceTransformer(model_name)
+    texts = [doc['text'] for doc in docs]
+    embeddings = model.encode(texts, show_progress_bar=True, normalize_embeddings=True)
+    np.save(cache_file, embeddings)
+    return embeddings
+
+def setup_bm25_index(docs: List[Dict], index_name: str, reset: bool = False):
+    es = Elasticsearch()
+    if reset and es.indices.exists(index=index_name):
+        es.indices.delete(index=index_name)
+    
+    if not es.indices.exists(index=index_name):
+        mappings = {
+            "mappings": {
+                "properties": {
+                    "text": {"type": "text", "analyzer": "standard"},
+                    "year": {"type": "integer"},
+                    "company": {"type": "keyword"},
+                    "lang": {"type": "keyword"},
+                    "doc_id": {"type": "keyword"}
+                }
+            }
+        }
+        es.indices.create(index=index_name, body=mappings)
+    
+    actions = []
+    for doc in docs:
+        action = {
+            "_index": index_name,
+            "_id": doc['doc_id'],
+            "_source": {
+                "text": doc['text'],
+                "year": doc['year'],
+                "company": doc['company'],
+                "lang": doc['lang']
+            }
+        }
+        actions.append(action)
+        if len(actions) >= 500:
+            helpers.bulk(es, actions)
+            actions = []
+    if actions:
+        helpers.bulk(es, actions)
+    return es
+
+def bm25_search(es: Elasticsearch, query_text: str, target_year: int, k: int = 100) -> List[Tuple[str, float]]:
+    resp = es.search(index=INDEX_NAME, body={
+        "query": {"match": {"text": query_text}},
+        "size": k
+    })
+    results = [(hit['_id'], hit['_score']) for hit in resp['hits']['hits']]
+    return results
+
+def temporal_score(query_year: int, doc_year: int, lambda_decay: float = 0.3) -> float:
+    diff = abs(query_year - doc_year)
+    return np.exp(-lambda_decay * diff)
+
+def hybrid_retrieval(query: Dict, docs: List[Dict], doc_embeddings: np.ndarray,
+                     es: Elasticsearch, weights: Dict, lambda_decay: float, k: int = 10) -> List[Dict]:
+    query_text = query['text']
+    query_year = query['target_year']
+    
+    bm25_results = bm25_search(es, query_text, query_year, k=200)
+    bm25_dict = {doc_id: score for doc_id, score in bm25_results}
+    
+    model = SentenceTransformer(EMBEDDING_MODEL)
+    query_emb = model.encode([query_text], normalize_embeddings=True)[0]
+    
+    doc_id_to_idx = {doc['doc_id']: idx for idx, doc in enumerate(docs)}
+    
+    scores = []
+    for doc_id, bm25_score in bm25_results:
+        idx = doc_id_to_idx[doc_id]
+        doc_emb = doc_embeddings[idx]
+        dense_score = np.dot(query_emb, doc_emb)
+        temp_score = temporal_score(query_year, docs[idx]['year'], lambda_decay)
+        
+        final_score = (weights['lex'] * bm25_score +
+                       weights['sem'] * dense_score +
+                       weights['temp'] * temp_score)
+        scores.append({
+            'doc_id': doc_id,
+            'year': docs[idx]['year'],
+            'company': docs[idx]['company'],
+            'score': final_score,
+            'bm25': bm25_score,
+            'dense': dense_score,
+            'temp': temp_score
+        })
+    
+    scores.sort(key=lambda x: x['score'], reverse=True)
+    return scores[:k]
+
+def evaluate_predictions(queries: List[Dict], predictions: List[List[Dict]], k: int = 10):
+    temporal_correct = 0
+    company_correct = 0
+    for q, preds in zip(queries, predictions):
+        target_year = q['target_year']
+        target_company = q['target_company']
+        
+        if any(p['year'] == target_year for p in preds):
+            temporal_correct += 1
+        
+        if any(p['company'] == target_company for p in preds):
+            company_correct += 1
+    
+    temporal_acc = temporal_correct / len(queries)
+    company_acc = company_correct / len(queries)
+    combined = (temporal_acc + company_acc) / 2
+    return temporal_acc, company_acc, combined
+
+if __name__ == "__main__":
+    docs = load_documents(DATA_DIR)
+    queries = load_queries(QUERY_FILE)
+    
+    doc_embeddings = generate_or_load_embeddings(docs, EMBEDDING_MODEL, EMBEDDING_CACHE)
+    
+    es = setup_bm25_index(docs, INDEX_NAME, reset=False)
+    
+    all_predictions = []
+    for q in queries:
+        top_docs = hybrid_retrieval(q, docs, doc_embeddings, es, WEIGHTS, TEMPORAL_LAMBDA, k=TOP_K)
+        all_predictions.append(top_docs)
+    
+    temporal_acc, company_acc, combined = evaluate_predictions(queries, all_predictions, k=TOP_K)
+    print(f"Temporal@{TOP_K}: {temporal_acc:.3f}")
+    print(f"Company@{TOP_K}: {company_acc:.3f}")
+    print(f"Combined: {combined:.3f}")
