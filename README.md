@@ -33,4 +33,6 @@ The full set of **40,814 document chunks** is available for download at:
 After downloading, extract the contents and update the `DATA_DIR` path in the script.
 
 ---
-
+We would like to keep our selected companies' ESG report PDFs private due to usage concern. 
+Thank you for visiting our work. If you find our work useful for your paper, please cite it. 
+Good luck on your journey!
